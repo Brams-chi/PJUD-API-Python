@@ -1,6 +1,13 @@
 """
 PJUD Scraper Core — Módulo reutilizable
 Importado por la API FastAPI. No tiene main() propio.
+
+Flujo:
+  1. home/index.php  → cerrar modal via JS (Bootstrap aria-hidden)
+  2. indexN.php      → formulario de causas
+  3. llenar campos   → IDs confirmados del DOM
+  4. 2captcha        → resolver reCAPTCHA automáticamente
+  5. httpx POST      → endpoint XHR con cookies de sesión
 """
 
 import asyncio
@@ -9,7 +16,6 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
-from datetime import datetime
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -17,17 +23,17 @@ from playwright.async_api import async_playwright, Page
 
 
 # ─────────────────────────────────────────────────────────────
-# Modelos de datos
+# Modelos
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
 class Causa:
     rol: str = ""
-    tipo_recurso: str = ""        # columna 2 (antes "corte" — renombrada)
+    tipo_recurso: str = ""
     caratulado: str = ""
     fecha_ingreso: str = ""
     estado_causa: str = ""
-    corte: str = ""               # columna 6 real de la tabla
+    corte: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -62,6 +68,8 @@ class BusquedaBase(ABC):
         return f"{self.BASE_URL}/{self.endpoint}"
 
 
+# ── Búsqueda por RIT ─────────────────────────────────────────
+
 @dataclass
 class BusquedaRit(BusquedaBase):
     rol: str
@@ -78,20 +86,21 @@ class BusquedaRit(BusquedaBase):
 
     def payload(self, captcha_token: str) -> dict:
         return {
-            self.captcha_field: captcha_token,
-            "action": self.captcha_action,
-            "competencia": self.competencia,
-            "conCorte": self.corte,
-            "conTipoBusApe": self.tipo_busqueda,
-            "radio-groupPenal": "1",
-            "radio-group": self.radio_group,
-            "conRolCausa": self.rol,
-            "conEraCausa": self.anio,
+            self.captcha_field:  captcha_token,
+            "action":            self.captcha_action,
+            "competencia":       self.competencia,
+            "conCorte":          self.corte,
+            "conTipoBusApe":     self.tipo_busqueda,
+            "radio-groupPenal":  "1",
+            "radio-group":       self.radio_group,
+            "conRolCausa":       self.rol,
+            "conEraCausa":       self.anio,
             "ruc1": "", "ruc2": "", "rucPen1": "", "rucPen2": "",
-            "conCaratulado": self.caratulado,
+            "conCaratulado":     self.caratulado,
         }
 
     async def llenar_formulario(self, page: Page) -> None:
+        # Tab RIT ya está activo por defecto
         await page.select_option("#competencia", value=self.competencia)
         await asyncio.sleep(0.5)
         await page.select_option("#conCorte", value=self.corte)
@@ -102,7 +111,10 @@ class BusquedaRit(BusquedaBase):
         await page.fill("#conEraCausa", self.anio)
         if self.caratulado:
             await page.fill("#conCaratulado", self.caratulado)
+        print(f"  Formulario RIT llenado: rol={self.rol}, año={self.anio}")
 
+
+# ── Búsqueda por Nombre ───────────────────────────────────────
 
 @dataclass
 class BusquedaNombre(BusquedaBase):
@@ -121,21 +133,22 @@ class BusquedaNombre(BusquedaBase):
 
     def payload(self, captcha_token: str) -> dict:
         return {
-            self.captcha_field: captcha_token,
-            "action": self.captcha_action,
-            "radio-group": self.radio_group,
-            "nomNombre": self.nombre,
-            "nomApePaterno": self.ape_paterno,
-            "nomApeMaterno": self.ape_materno,
-            "nomEra": self.anio,
-            "nomNombreJur": self.nombre_jur,
-            "nomEraJur": self.anio_jur,
-            "nomCompetencia": self.competencia,
+            self.captcha_field:  captcha_token,
+            "action":            self.captcha_action,
+            "radio-group":       self.radio_group,
+            "nomNombre":         self.nombre,
+            "nomApePaterno":     self.ape_paterno,
+            "nomApeMaterno":     self.ape_materno,
+            "nomEra":            self.anio,
+            "nomNombreJur":      self.nombre_jur,
+            "nomEraJur":         self.anio_jur,
+            "nomCompetencia":    self.competencia,
         }
 
     async def llenar_formulario(self, page: Page) -> None:
+        # Clic en tab "Búsqueda por Nombre" — está en indexN.php
         await page.click("text=Búsqueda por Nombre")
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
         await page.check("#radioPerNatural")
         await page.fill("#nomNombre", self.nombre)
         await page.fill("#nomApePaterno", self.ape_paterno)
@@ -145,6 +158,7 @@ class BusquedaNombre(BusquedaBase):
             await page.fill("#nomEra", self.anio)
         await page.select_option("#nomCompetencia", value=self.competencia)
         await asyncio.sleep(0.3)
+        print(f"  Formulario Nombre llenado: {self.nombre} {self.ape_paterno}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -172,7 +186,7 @@ HEADERS = {
 
 
 # ─────────────────────────────────────────────────────────────
-# Resolver reCAPTCHA (2captcha)
+# Resolver reCAPTCHA via 2captcha
 # ─────────────────────────────────────────────────────────────
 
 async def resolver_recaptcha_2captcha(site_key: str, page_url: str) -> str:
@@ -189,6 +203,7 @@ async def resolver_recaptcha_2captcha(site_key: str, page_url: str) -> str:
         if resp["status"] != 1:
             raise RuntimeError(f"2captcha submit error: {resp}")
         captcha_id = resp["request"]
+        print(f"  reCAPTCHA enviado a 2captcha (id: {captcha_id})...")
 
         for intento in range(24):
             await asyncio.sleep(5)
@@ -197,6 +212,7 @@ async def resolver_recaptcha_2captcha(site_key: str, page_url: str) -> str:
             })
             resp = r.json()
             if resp["status"] == 1:
+                print(f"  ✓ reCAPTCHA resuelto en {(intento+1)*5}s")
                 return resp["request"]
             if resp["request"] != "CAPCHA_NOT_READY":
                 raise RuntimeError(f"2captcha error: {resp}")
@@ -205,12 +221,51 @@ async def resolver_recaptcha_2captcha(site_key: str, page_url: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Obtener sesión + token via Playwright
+# Navegación y obtención de sesión
 # ─────────────────────────────────────────────────────────────
+
+async def _cerrar_modal(page: Page) -> None:
+    """
+    Cierra el modal de aviso PJUD via JavaScript.
+    Bootstrap marca el modal con aria-hidden=true → Playwright no lo ve como visible.
+    La solución es ejecutar el clic directamente en el DOM.
+    """
+    try:
+        # Esperar que el modal tenga display:block (animación Bootstrap)
+        await page.wait_for_function(
+            """() => {
+                const m = document.querySelector('.modal');
+                return m && window.getComputedStyle(m).display !== 'none';
+            }""",
+            timeout=8000,
+        )
+        # Cerrar via JS — bypasea aria-hidden
+        await page.evaluate("""
+            () => {
+                const btn = document.querySelector(
+                    '.modal .btn[data-dismiss="modal"], .modal button[data-dismiss="modal"]'
+                );
+                if (btn) btn.click();
+                // Fallback: forzar cierre visual
+                const modal = document.querySelector('.modal');
+                if (modal) {
+                    modal.style.display = 'none';
+                    modal.classList.remove('show');
+                    document.body.classList.remove('modal-open');
+                    const backdrop = document.querySelector('.modal-backdrop');
+                    if (backdrop) backdrop.remove();
+                }
+            }
+        """)
+        print("  Modal cerrado via JS")
+        await asyncio.sleep(0.3)
+    except Exception:
+        print("  Modal no detectado, continuando...")
+
 
 async def obtener_sesion_y_token(
     busqueda: BusquedaBase,
-    usar_2captcha: bool = False,
+    usar_2captcha: bool = True,
 ) -> tuple[dict, str]:
     cookies_result = {}
     captcha_token = {"value": ""}
@@ -218,7 +273,12 @@ async def obtener_sesion_y_token(
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=usar_2captcha,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-gpu",                  # necesario en Windows headless
+                "--disable-dev-shm-usage",
+            ],
         )
         context = await browser.new_context(
             user_agent=HEADERS["User-Agent"],
@@ -226,97 +286,79 @@ async def obtener_sesion_y_token(
             locale="es-CL",
         )
         page = await context.new_page()
-        page.set_default_timeout(90000)        # timeout global para todos los selectores
+        page.set_default_timeout(90000)
         page.set_default_navigation_timeout(90000)
+
         await page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
-        # Paso 1: home/index.php — tiene modal de aviso que hay que cerrar
-        print("  Navegando a home...")
+        # ── Paso 1: home (modal de aviso) ──────────────────────
+        print("  [1/4] Navegando al home...")
         await page.goto(
             "https://oficinajudicialvirtual.pjud.cl/home/index.php",
             wait_until="domcontentloaded",
             timeout=90000,
         )
-        print(f"  URL home: {page.url}")
+        await _cerrar_modal(page)
+        await page.locator(".landing").click()
 
-        # Esperar que la página cargue completamente — en headless tarda más
-        # Intentar con múltiples selectores conocidos del formulario
+
+        # ── Paso 2: formulario de causas ────────────────────────
+        print("  [2/4] Navegando al formulario...")
+        print(f"  URL activa: {page.url}")
+
+        await page.goto(
+            "https://oficinajudicialvirtual.pjud.cl/indexN.php",
+            wait_until="domcontentloaded",
+            timeout=90000,
+        )
+
+        # Esperar que el formulario esté listo
         loaded = False
-        for selector in ["select", "#nomNombre", "#conRolCausa", "form", ".nav-tabs"]:
+        for selector in ["select", "#nomNombre", "#conRolCausa", ".nav-tabs"]:
             try:
                 await page.wait_for_selector(selector, timeout=10000)
                 loaded = True
                 break
             except Exception:
                 pass
-
         if not loaded:
-            import asyncio as _asyncio
-            await _asyncio.sleep(5)
+            await asyncio.sleep(5)
 
-        # Log URL — si no es indexN.php el sitio bloqueó o redirigió
-        cur_url = page.url
-        print(f"  URL actual tras carga: {cur_url}")
-        if "indexN.php" not in cur_url and "index" not in cur_url:
-            raise RuntimeError(f"El sitio redirigió inesperadamente a: {cur_url}")
 
-        # ── Cerrar modal de bienvenida (aviso PJUD) ──
-        # El modal usa Bootstrap con aria-hidden y display:block — no es "visible"
-        # para Playwright aunque sí renderice. Cerramos via JS directamente.
-        try:
-            # Esperar a que el modal exista en el DOM y tenga display:block
-            await page.wait_for_function(
-                """() => {
-                    const modal = document.querySelector('.modal');
-                    return modal && window.getComputedStyle(modal).display !== 'none';
-                }""",
-                timeout=8000,
-            )
-            # Cerrar via JS — evita el problema de visibilidad de Playwright
-            await page.evaluate("""
-                () => {
-                    // Intentar cerrar con jQuery/Bootstrap si está disponible
-                    const btn = document.querySelector('.modal .btn-primary[data-dismiss="modal"], .modal .btn-secondary[data-dismiss="modal"], .modal button[data-dismiss="modal"]');
-                    if (btn) btn.click();
-                    // Fallback: ocultar el modal directamente
-                    const modal = document.querySelector('.modal');
-                    if (modal) {
-                        modal.style.display = 'none';
-                        modal.classList.remove('show');
-                        document.body.classList.remove('modal-open');
-                        const backdrop = document.querySelector('.modal-backdrop');
-                        if (backdrop) backdrop.remove();
-                    }
-                }
-            """)
-            print("  Modal cerrado via JS")
-            await asyncio.sleep(0.3)
-        except Exception:
-            print("  Modal no detectado, continuando...")
-
-        # Paso 2: navegar al buscador de causas
-        print("  Navegando a indexN.php...")
-        await page.goto(
-            "https://oficinajudicialvirtual.pjud.cl/indexN.php",
-            wait_until="domcontentloaded",
-            timeout=90000,
-        )
-        print(f"  URL formulario: {page.url}")
-
+        # ── Paso 3: llenar formulario ───────────────────────────
+        print("  [3/4] Llenando formulario...")
+        print(f"  URL activa: {page.url}")
         await busqueda.llenar_formulario(page)
 
+        # ── Paso 4: resolver reCAPTCHA ──────────────────────────
+        print("  [4/4] Resolviendo reCAPTCHA...")
         if usar_2captcha:
             site_key = await page.get_attribute(".g-recaptcha", "data-sitekey")
-            token = await resolver_recaptcha_2captcha(site_key, "https://oficinajudicialvirtual.pjud.cl/indexN.php")
-            await page.evaluate(f'document.getElementById("{busqueda.captcha_field}").value = "{token}"')
+            token = await resolver_recaptcha_2captcha(
+                site_key=site_key,
+                page_url="https://oficinajudicialvirtual.pjud.cl/indexN.php",
+            )
+            await page.evaluate(
+                f'document.getElementById("{busqueda.captcha_field}").value = "{token}"'
+            )
             captcha_token["value"] = token
         else:
-            # Modo interactivo: esperar token externo inyectado vía endpoint /captcha-token
-            # La API llama a este método con usar_2captcha=True siempre
-            # Este branch solo se usa en modo CLI
-            raise RuntimeError("Modo manual no disponible en contexto API. Usar 2captcha.")
+            # Modo manual CLI
+            print("  ⚠ Resuelve el reCAPTCHA en el browser y presiona ENTER...")
+            await asyncio.get_event_loop().run_in_executor(None, input)
+            captcha_token["value"] = await page.evaluate(
+                f'document.getElementById("{busqueda.captcha_field}")?.value || ""'
+            )
+            if not captcha_token["value"]:
+                captcha_token["value"] = await page.evaluate("""
+                    () => {
+                        const fields = document.querySelectorAll('textarea[id*="recaptcha"]');
+                        for (const f of fields) { if (f.value) return f.value; }
+                        return "";
+                    }
+                """)
 
         all_cookies = await context.cookies()
         cookies_result = {c["name"]: c["value"] for c in all_cookies}
@@ -326,7 +368,7 @@ async def obtener_sesion_y_token(
 
 
 # ─────────────────────────────────────────────────────────────
-# Ejecutar consulta y parsear
+# Ejecutar consulta con httpx
 # ─────────────────────────────────────────────────────────────
 
 async def ejecutar_consulta(
@@ -345,11 +387,17 @@ async def ejecutar_consulta(
         )
         r.raise_for_status()
 
+    # Guardar respuesta raw para debug
+    debug_file = f"respuesta_{busqueda.__class__.__name__.lower()}.html"
+    with open(debug_file, "w", encoding="utf-8") as f:
+        f.write(r.text)
+    print(f"  Respuesta guardada en {debug_file}")
+
     return _parsear_respuesta(r.text)
 
 
 def _parsear_respuesta(html: str) -> list[Causa]:
-    # Intentar JSON
+    # Intentar JSON primero
     try:
         data = json.loads(html)
         items = data if isinstance(data, list) else data.get("causas", [])
@@ -364,12 +412,14 @@ def _parsear_respuesta(html: str) -> list[Causa]:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # HTML con tabla — columnas reales: [lupa] | Rol | Tipo Recurso | Caratulado | Fecha Ingreso | Estado Causa | Corte
+    # HTML con tabla
+    # Columnas reales: [lupa] | Rol | Tipo Recurso | Caratulado | Fecha Ingreso | Estado Causa | Corte
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "lxml")
     causas = []
     tabla = soup.find("table")
     if not tabla:
+        print("  ⚠ Sin tabla en respuesta — revisar archivo de debug")
         return []
 
     for fila in tabla.find_all("tr")[1:]:
@@ -377,7 +427,7 @@ def _parsear_respuesta(html: str) -> list[Causa]:
         n = len(celdas)
         if n < 2:
             continue
-        # col 0 = ícono lupa (sin texto), col 1..6 = datos
+        # col 0 = ícono lupa (sin texto) → offset=1
         offset = 1 if (n >= 7 and not celdas[0].get_text(strip=True)) else 0
         if n - offset >= 6:
             causas.append(Causa(
@@ -395,8 +445,15 @@ def _parsear_respuesta(html: str) -> list[Causa]:
 # Función principal (usada por la API)
 # ─────────────────────────────────────────────────────────────
 
-async def consultar(busqueda: BusquedaBase, usar_2captcha: bool = True) -> list[Causa]:
+async def consultar(
+    busqueda: BusquedaBase,
+    usar_2captcha: bool = True,
+) -> list[Causa]:
+    print(f"\n=== {busqueda.__class__.__name__} ===")
     cookies, token = await obtener_sesion_y_token(busqueda, usar_2captcha)
     if not token:
         raise RuntimeError("No se obtuvo token de captcha")
-    return await ejecutar_consulta(busqueda, cookies, token)
+    print("  Ejecutando consulta al endpoint...")
+    causas = await ejecutar_consulta(busqueda, cookies, token)
+    print(f"  ✓ {len(causas)} causa(s) encontrada(s)")
+    return causas
